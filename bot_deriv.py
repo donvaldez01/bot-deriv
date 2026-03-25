@@ -225,4 +225,5 @@ async def conectar():
             print("Reconectando em 5 segundos...")
             await asyncio.sleep(5)
 
-await conectar()
+if __name__ == "__main__":
+    asyncio.run(conectar())
