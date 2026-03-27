@@ -1,2 +1,2 @@
-websockets
-anthropic
+websockets==12.0
+anthropic>=0.25.0
