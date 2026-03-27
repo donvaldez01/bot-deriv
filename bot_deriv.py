@@ -143,7 +143,7 @@ ESTADO:
 REGRAS:
 1. losses_seguidos >= {STOP_SEQ} → acao = PAUSAR
 2. daily_loss >= {MAX_DAILY_LOSS} → acao = PARAR_DIA
-3. stake máximo: 1% do saldo
+3. stake SEMPRE exatamente 1% do saldo = use round(balance * 0.01, 2)
 
 TIPOS DE CONTRATO DISPONÍVEIS E QUANDO USAR:
 - CALL / PUT → volatilidade média, tendência clara (tendencia_pct > 0.002)
@@ -161,7 +161,7 @@ IMPORTANTE:
 - Para NOTOUCH duração: 5 minutos
 
 Responda SOMENTE com JSON puro, sem markdown, sem backticks:
-{{"acao":"DIGITEVEN","duracao":5,"unidade":"t","stake":0.35,"barrier":null,"confianca":0.7,"raciocinio":"motivo curto"}}
+{{"acao":"DIGITEVEN","duracao":5,"unidade":"t","stake":0.50,"barrier":null,"confianca":0.7,"raciocinio":"motivo curto"}}
 
 acao pode ser: CALL, PUT, NOTOUCH, DIGITEVEN, DIGITODD, DIGITOVER, DIGITUNDER, AGUARDAR, PAUSAR, PARAR_DIA"""
 
@@ -281,7 +281,7 @@ async def conectar() -> None:
                             continue
 
                         # Stake limitado a 1% do saldo
-                        stake  = min(decisao.get("stake", STAKE), round(state["balance"] * 0.01, 2))
+                        stake  = round(state["balance"] * 0.01, 2)
                         params = montar_parametros(acao, stake, features["preco_atual"])
                         if params is None:
                             continue
