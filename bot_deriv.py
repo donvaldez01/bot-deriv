@@ -307,43 +307,35 @@ async def conectar() -> None:
                         espera       = tempo_espera(acao)
                         log.info(f"Ordem aberta — contrato {contract_id} — ${preco_compra:.2f} — aguardando {espera}s...")
 
+                        saldo_antes = state["balance"]
                         await asyncio.sleep(espera)
 
-                        # ── Consulta resultado via req_id ─────────────────────
-                        lucro  = 0.0
-                        status = "desconhecido"
-                        for tentativa_res in range(5):
-                            try:
-                                resp = await ws_request(
-                                    ws,
-                                    {"proposal_open_contract": 1, "contract_id": contract_id, "subscribe": 0},
-                                    pendentes, timeout=10
-                                )
-                            except asyncio.TimeoutError:
-                                log.warning(f"Timeout consultando contrato, tentativa {tentativa_res + 1}/5")
-                                await asyncio.sleep(3)
-                                continue
-
-                            contrato = resp.get("proposal_open_contract", {})
-                            status   = contrato.get("status", "desconhecido")
-                            if status in ("won", "lost", "sold"):
-                                lucro = float(contrato.get("profit", 0))
-                                break
-                            log.info(f"Resultado pendente, tentativa {tentativa_res + 1}/5...")
-                            await asyncio.sleep(3)
+                        # ── Consulta saldo após o contrato encerrar ───────────
+                        try:
+                            resp_balance = await ws_request(
+                                ws, {"balance": 1}, pendentes, timeout=10
+                            )
+                            saldo_depois = float(resp_balance.get("balance", {}).get("balance", saldo_antes))
+                            state["balance"] = saldo_depois
+                        except asyncio.TimeoutError:
+                            log.warning("Timeout consultando saldo, usando valor anterior.")
+                            saldo_depois = saldo_antes
 
                         # ── Atualiza estado ───────────────────────────────────
-                        if lucro < 0:
-                            state["losses_seguidos"] += 1
-                            state["daily_loss"] += abs(lucro)
-                        else:
+                        variacao = round(saldo_depois - saldo_antes, 2)
+                        if variacao >= 0:
+                            emoji = "✅ GANHOU"
                             state["losses_seguidos"] = 0
+                        else:
+                            emoji = "❌ PERDEU"
+                            state["losses_seguidos"] += 1
+                            state["daily_loss"] += abs(variacao)
                         state["trades_hoje"] += 1
 
-                        emoji = "✅ GANHOU" if lucro >= 0 else "❌ PERDEU"
                         msg = (
-                            f"{emoji} | {acao} | {status}\n"
-                            f"Lucro: ${lucro:+.2f}\n"
+                            f"{emoji} | {acao}\n"
+                            f"Saldo: ${saldo_depois:.2f} (era ${saldo_antes:.2f})\n"
+                            f"Variação: ${variacao:+.2f}\n"
                             f"Razão: {razao}\n"
                             f"Trades hoje: {state['trades_hoje']}\n"
                             f"Losses seguidos: {state['losses_seguidos']}"
