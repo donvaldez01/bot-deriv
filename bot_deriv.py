@@ -287,7 +287,7 @@ async def conectar() -> None:
 
                         stake = min(
                             decisao.get("stake", STAKE),
-                            round(state["balance"] * 0.05, 2),
+                            round(state["balance"] * 0.01, 2),
                         )
                         params = montar_parametros(acao, stake, features["preco_atual"])
                         if params is None:
