@@ -192,6 +192,20 @@ def tempo_espera(acao: str) -> int:
     return 15
 
 
+# ── Receptor de mensagens WebSocket ──────────────────────────────────────────
+# Roda em paralelo ao loop principal e distribui mensagens por tipo em filas
+async def receptor(ws, fila_ticks: asyncio.Queue, fila_buy: asyncio.Queue, fila_contrato: asyncio.Queue):
+    async for mensagem in ws:
+        data = json.loads(mensagem)
+        if "tick" in data:
+            await fila_ticks.put(data["tick"])
+        elif "buy" in data:
+            await fila_buy.put(data)
+        elif "proposal_open_contract" in data:
+            await fila_contrato.put(data)
+        # outras mensagens (ex: authorize) são ignoradas aqui
+
+
 # ── Loop principal ────────────────────────────────────────────────────────────
 async def conectar() -> None:
     tentativa = 0
@@ -202,7 +216,7 @@ async def conectar() -> None:
             async with websockets.connect(
                 DERIV_WS_URL, ping_interval=30, ping_timeout=10
             ) as ws:
-                tentativa = 0  # reset ao conectar com sucesso
+                tentativa = 0
 
                 # ── Autenticação ──────────────────────────────────────────────
                 await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
@@ -220,124 +234,149 @@ async def conectar() -> None:
                 await ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
                 log.info("Recebendo ticks... aguarde 30 para primeira análise.")
 
+                fila_ticks    = asyncio.Queue()
+                fila_buy      = asyncio.Queue()
+                fila_contrato = asyncio.Queue()
+
+                # Inicia receptor em background
+                task_receptor = asyncio.create_task(
+                    receptor(ws, fila_ticks, fila_buy, fila_contrato)
+                )
+
                 ciclo = 0
-                pending_contract_id: str | None = None
+                try:
+                    while True:
+                        # ── Consome ticks da fila ─────────────────────────────
+                        tick = await fila_ticks.get()
+                        state["ticks"].append({"quote": float(tick["quote"]), "epoch": tick["epoch"]})
+                        if len(state["ticks"]) > 100:
+                            state["ticks"] = state["ticks"][-100:]
 
-                async for mensagem in ws:
-                    data = json.loads(mensagem)
+                        ciclo += 1
+                        print(f"\r  tick #{ciclo} — preço: {tick['quote']}", end="", flush=True)
 
-                    # ── Trata respostas de compra pendentes ───────────────────
-                    # (o WS pode entregar a resposta do buy misturada com ticks)
-                    if "buy" in data and pending_contract_id is None:
-                        if "error" in data:
-                            log.error(f"Erro na ordem: {data['error']['message']}")
-                            await telegram(f"Erro na ordem: {data['error']['message']}")
+                        if ciclo % 30 != 0:
+                            continue
+
+                        # ── Análise a cada 30 ticks ───────────────────────────
+                        print()
+                        features = calcular_features()
+                        if not features:
+                            continue
+
+                        log.info("Consultando Claude...")
+                        decisao = await perguntar_claude(features)
+                        acao  = decisao.get("acao", "AGUARDAR")
+                        razao = decisao.get("raciocinio", "")
+                        log.info(f"Decisão: {acao} — {razao}")
+
+                        if acao == "PARAR_DIA":
+                            await telegram(f"Fim do dia. Loss total: ${state['daily_loss']:.2f}")
+                            task_receptor.cancel()
+                            return
+
+                        if acao == "PAUSAR":
+                            await telegram(f"Pausando 5 min após {state['losses_seguidos']} losses.")
+                            await asyncio.sleep(300)
+                            state["losses_seguidos"] = 0
+                            continue
+
+                        if acao == "AGUARDAR" or acao not in TIPOS_VALIDOS:
+                            log.info(f"Aguardando... ({razao})")
+                            continue
+
+                        stake = min(
+                            decisao.get("stake", STAKE),
+                            round(state["balance"] * 0.05, 2),
+                        )
+                        params = montar_parametros(acao, stake, features["preco_atual"])
+                        if params is None:
+                            log.warning(f"Parâmetros inválidos para ação '{acao}', pulando.")
+                            continue
+
+                        # ── Envia ordem e aguarda confirmação ─────────────────
+                        # Limpa fila antes de enviar para não pegar resposta antiga
+                        while not fila_buy.empty():
+                            fila_buy.get_nowait()
+
+                        await ws.send(json.dumps({"buy": 1, "price": stake, "parameters": params}))
+                        log.info(f"Ordem enviada — {acao} — aguardando confirmação...")
+
+                        # Espera a resposta do buy (timeout 10s)
+                        try:
+                            resp_buy = await asyncio.wait_for(fila_buy.get(), timeout=10)
+                        except asyncio.TimeoutError:
+                            log.error("Timeout aguardando confirmação da ordem.")
+                            await telegram(f"Erro: sem confirmação da ordem {acao} em 10s.")
+                            continue
+
+                        if "error" in resp_buy:
+                            erro = resp_buy["error"]["message"]
+                            log.error(f"Erro na ordem: {erro}")
+                            await telegram(f"Erro na ordem ({acao}): {erro}")
+                            continue
+
+                        contract_id  = resp_buy["buy"]["contract_id"]
+                        preco_compra = resp_buy["buy"]["buy_price"]
+                        espera       = tempo_espera(acao)
+                        log.info(f"Ordem aberta — contrato {contract_id} — ${preco_compra:.2f} — aguardando {espera}s...")
+
+                        # Espera o contrato encerrar
+                        await asyncio.sleep(espera)
+
+                        # ── Consulta resultado ────────────────────────────────
+                        lucro  = 0.0
+                        status = "desconhecido"
+                        for tentativa_res in range(5):
+                            # Limpa fila antes de cada consulta
+                            while not fila_contrato.empty():
+                                fila_contrato.get_nowait()
+
+                            await ws.send(json.dumps({
+                                "proposal_open_contract": 1,
+                                "contract_id": contract_id,
+                                "subscribe": 0,
+                            }))
+
+                            try:
+                                resp_status = await asyncio.wait_for(fila_contrato.get(), timeout=10)
+                            except asyncio.TimeoutError:
+                                log.warning(f"Timeout consultando contrato, tentativa {tentativa_res + 1}/5")
+                                await asyncio.sleep(3)
+                                continue
+
+                            contrato = resp_status.get("proposal_open_contract", {})
+                            status   = contrato.get("status", "desconhecido")
+                            if status in ("won", "lost", "sold"):
+                                lucro = float(contrato.get("profit", 0))
+                                break
+                            log.info(f"Resultado pendente, tentativa {tentativa_res + 1}/5...")
+                            await asyncio.sleep(3)
+
+                        # ── Atualiza estado ───────────────────────────────────
+                        if lucro < 0:
+                            state["losses_seguidos"] += 1
+                            state["daily_loss"] += abs(lucro)
                         else:
-                            pending_contract_id = data["buy"]["contract_id"]
-                            preco_compra = data["buy"]["buy_price"]
-                            log.info(f"Ordem aberta — contrato {pending_contract_id} — ${preco_compra:.2f}")
-                        continue
+                            state["losses_seguidos"] = 0
+                        state["trades_hoje"] += 1
 
-                    if "tick" not in data:
-                        continue
+                        emoji = "✅ GANHOU" if lucro >= 0 else "❌ PERDEU"
+                        msg = (
+                            f"{emoji} | {acao} | {status}\n"
+                            f"Lucro: ${lucro:+.2f}\n"
+                            f"Razão: {razao}\n"
+                            f"Trades hoje: {state['trades_hoje']}\n"
+                            f"Losses seguidos: {state['losses_seguidos']}"
+                        )
+                        log.info(msg)
+                        await telegram(msg)
 
-                    tick = data["tick"]
-                    state["ticks"].append({"quote": float(tick["quote"]), "epoch": tick["epoch"]})
-                    if len(state["ticks"]) > 100:
-                        state["ticks"] = state["ticks"][-100:]
-
-                    ciclo += 1
-                    print(f"\r  tick #{ciclo} — preço: {tick['quote']}", end="", flush=True)
-
-                    if ciclo % 30 != 0:
-                        continue
-
-                    # ── Análise a cada 30 ticks ───────────────────────────────
-                    print()  # nova linha após os prints inline
-                    features = calcular_features()
-                    if not features:
-                        continue
-
-                    log.info("Consultando Claude...")
-                    decisao = await perguntar_claude(features)
-                    acao  = decisao.get("acao", "AGUARDAR")
-                    razao = decisao.get("raciocinio", "")
-                    log.info(f"Decisão: {acao} — {razao}")
-
-                    if acao == "PARAR_DIA":
-                        await telegram(f"Fim do dia. Loss total: ${state['daily_loss']:.2f}")
-                        return
-
-                    if acao == "PAUSAR":
-                        await telegram(f"Pausando 5 min após {state['losses_seguidos']} losses.")
-                        await asyncio.sleep(300)
-                        state["losses_seguidos"] = 0
-                        continue
-
-                    if acao == "AGUARDAR" or acao not in TIPOS_VALIDOS:
-                        log.info(f"Aguardando... ({razao})")
-                        continue
-
-                    stake = min(
-                        decisao.get("stake", STAKE),
-                        round(state["balance"] * 0.05, 2),
-                    )
-                    params = montar_parametros(acao, stake, features["preco_atual"])
-                    if params is None:
-                        log.warning(f"Parâmetros inválidos para ação '{acao}', pulando.")
-                        continue
-
-                    # ── Envia ordem ───────────────────────────────────────────
-                    await ws.send(json.dumps({"buy": 1, "price": stake, "parameters": params}))
-                    espera = tempo_espera(acao)
-                    log.info(f"Ordem enviada — {acao} — aguardando {espera}s pelo resultado...")
-                    await asyncio.sleep(espera)
-
-                    # ── Consulta resultado ────────────────────────────────────
-                    contract_id_to_check = pending_contract_id
-                    pending_contract_id = None
-                    if contract_id_to_check is None:
-                        log.warning("contract_id não registrado, pulando verificação.")
-                        continue
-
-                    lucro  = 0.0
-                    status = "desconhecido"
-                    for tentativa_res in range(5):
-                        await ws.send(json.dumps({
-                            "proposal_open_contract": 1,
-                            "contract_id": contract_id_to_check,
-                            "subscribe": 0,
-                        }))
-                        resp_status = json.loads(await ws.recv())
-                        contrato = resp_status.get("proposal_open_contract", {})
-                        status   = contrato.get("status", "desconhecido")
-                        if status in ("won", "lost", "sold"):
-                            lucro = float(contrato.get("profit", 0))
-                            break
-                        log.info(f"Resultado pendente, tentativa {tentativa_res + 1}/5...")
-                        await asyncio.sleep(3)
-
-                    # ── Atualiza estado ───────────────────────────────────────
-                    if lucro < 0:
-                        state["losses_seguidos"] += 1
-                        state["daily_loss"] += abs(lucro)
-                    else:
-                        state["losses_seguidos"] = 0
-                    state["trades_hoje"] += 1
-
-                    emoji = "✅ GANHOU" if lucro >= 0 else "❌ PERDEU"
-                    msg = (
-                        f"{emoji} | {acao} | {status}\n"
-                        f"Lucro: ${lucro:+.2f}\n"
-                        f"Razão: {razao}\n"
-                        f"Trades hoje: {state['trades_hoje']}\n"
-                        f"Losses seguidos: {state['losses_seguidos']}"
-                    )
-                    log.info(msg)
-                    await telegram(msg)
+                finally:
+                    task_receptor.cancel()
 
         except Exception as e:
-            wait = min(5 * tentativa, 60)  # backoff exponencial até 60s
+            wait = min(5 * tentativa, 60)
             log.error(f"Conexão perdida: {e}. Reconectando em {wait}s...")
             await asyncio.sleep(wait)
 
